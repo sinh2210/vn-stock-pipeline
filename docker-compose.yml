@@ -1,0 +1,111 @@
+version: "3.9"
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.1-python3.12
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-vnstock}:${POSTGRES_PASSWORD:-vnstock123}@db:5432/airflow_db
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    DATABASE_URL: postgresql://${POSTGRES_USER:-vnstock}:${POSTGRES_PASSWORD:-vnstock123}@db:5432/${POSTGRES_DB:-vnstock_db}
+    TICKERS: ${TICKERS:-VCB,TCB,BID,HPG,VNM,FPT,VHM,MSN,GAS,SSI}
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./ingestion:/opt/airflow/ingestion
+    - airflow_logs:/opt/airflow/logs
+  depends_on:
+    db:
+      condition: service_healthy
+
+services:
+  # ── TimescaleDB (PostgreSQL + time-series extension) ──────────────────────
+  db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: vnstock_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-vnstock}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vnstock123}
+      POSTGRES_DB: ${POSTGRES_DB:-vnstock_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/01_vnstock.sql
+      - ./database/init_airflow.sql:/docker-entrypoint-initdb.d/02_airflow.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vnstock}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── One-off ingestion (manual / backfill) ─────────────────────────────────
+  ingestion:
+    build:
+      context: ./ingestion
+      dockerfile: Dockerfile
+    container_name: vnstock_ingestion
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-vnstock}:${POSTGRES_PASSWORD:-vnstock123}@db:5432/${POSTGRES_DB:-vnstock_db}
+      TICKERS: ${TICKERS:-VCB,TCB,BID,HPG,VNM,FPT,VHM,MSN,GAS,SSI}
+      START_DATE: ${START_DATE:-2023-01-01}
+    volumes:
+      - ./ingestion:/app
+
+  # ── FastAPI backend ───────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: vnstock_backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-vnstock}:${POSTGRES_PASSWORD:-vnstock123}@db:5432/${POSTGRES_DB:-vnstock_db}
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ── Airflow webserver ─────────────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: vnstock_airflow_web
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    command: webserver
+
+  # ── Airflow scheduler ─────────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: vnstock_airflow_scheduler
+    restart: unless-stopped
+    command: scheduler
+
+  # ── Airflow init (run once to migrate DB + create admin user) ─────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: vnstock_airflow_init
+    restart: "no"
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow users create
+          --username admin --firstname Admin --lastname User
+          --role Admin --email admin@vnstock.local --password admin
+      "
+
+volumes:
+  pgdata:
+  airflow_logs:
